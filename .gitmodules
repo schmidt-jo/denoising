@@ -1,0 +1,3 @@
+[submodule "src/autodmri"]
+	path = src/autodmri
+	url = git@schmidt-jo:schmidt-jo/autodmri.git
