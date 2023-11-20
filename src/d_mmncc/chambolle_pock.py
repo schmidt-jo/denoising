@@ -1,10 +1,10 @@
 import logging
 import numpy as np
+import tqdm
+log_module = logging.getLogger(__name__)
 
-logModule = logging.getLogger(__name__)
 
-
-def chambolle_pock_tv(data, Lambda, n_it=100, return_all=False):
+def chambolle_pock_tv(data, Lambda, n_it=100):
     """
     Chambolle-Pock algorithm for Total Variation regularization.
     The following objective function is minimized :
@@ -21,14 +21,13 @@ def chambolle_pock_tv(data, Lambda, n_it=100, return_all=False):
 
     sigma = 1.0 / 3.6
     tau = 1.0 / 3.6
-    en = np.zeros(n_it)
 
     x = np.zeros_like(data)
     p = np.zeros_like(np.array(np.gradient(x)))
     q = np.zeros_like(data)
     x_tilde = np.zeros_like(x)
 
-    for k in range(0, n_it):
+    for _ in range(0, n_it):
         # Update dual variables
         # For anisotropic TV, the prox is a projection onto the L2 unit ball.
         # For anisotropic TV, this is a projection onto the L-infinity unit ball.
@@ -39,18 +38,7 @@ def chambolle_pock_tv(data, Lambda, n_it=100, return_all=False):
         x_old = x
         x = x + tau * np.sum(p, axis=0) - tau * q
         x_tilde = x + (x - x_old)
-        # Calculate norms
-        if return_all:
-            fidelity = 0.5 * np.linalg.norm(x - data)
-            tv = np.sum(np.abs(np.array(np.gradient(x))))
-            energy = 1.0 * fidelity + Lambda * tv
-            en[k] = energy
-            if k % 10 == 0:
-                logModule.info(f"{k} : energy {energy} \t fidelity {fidelity} \t TV {float(tv):.3f}")
+
     # constrain to >= 0
     x = np.clip(x, 0, np.max(x))
-    if return_all:
-        return en, x
-    else:
-        return x
-
+    return x
