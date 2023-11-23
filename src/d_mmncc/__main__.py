@@ -7,6 +7,8 @@ import pathlib as plib
 import scipy.special as ssp
 import tqdm
 
+logging.getLogger("simple_parsing").setLevel(logging.WARNING)
+
 
 def main(config: options.Config):
     # setup
@@ -35,13 +37,29 @@ def main(config: options.Config):
     d_nii_data = nii_data[:, :, :, 0].copy()
     # extract noise
     logging.info("__ Extract noise stats")
-    sigma, num_channels, mask = ade.estimate_from_dwis(
-        data=d_nii_data, axis=-1, return_mask=True,
-        exclude_mask=None, ncores=num_cpus, method="moments", verbose=2, fast_median=False
-    )
-    # save for debugging
-    # reshape
-    mask = np.repeat(mask[:, :, :, None], axis=-1, repeats=nii_data.shape[-1])
+    if config.use_3d:
+        # want to use 3 consecutive echoes to extract per axis
+        mask = np.zeros_like(nii_data, dtype=bool)
+        sigma = num_channels = np.zeros_like(nii_data[:, :, :, 0])
+        for k in range(3):
+            logging.info(f"\t dim {k + 1}")
+
+            s_, n_, mask_1d = ade.estimate_from_dwis(
+                data=d_nii_data[:, :, :], axis=k, return_mask=True,
+                exclude_mask=None, ncores=num_cpus, method="moments", verbose=2, fast_median=False
+            )
+            sigma = np.moveaxis(sigma, k, 0)
+            sigma += s_[:, None, None]
+            sigma = np.moveaxis(sigma, k, 0)
+            mask = mask | mask_1d[:, :, :, None]
+    else:
+        # using only slice dimension, assumed to be last dim
+        sigma, num_channels, mask = ade.estimate_from_dwis(
+            data=d_nii_data, axis=-1, return_mask=True,
+            exclude_mask=None, ncores=num_cpus, method="moments", verbose=2, fast_median=False
+        )
+        # reshape
+        mask = np.repeat(mask[:, :, :, None], axis=-1, repeats=nii_data.shape[-1])
     # save mask
     d_io.save_nii(mask, file_path=path, name=f"autodmri_mask", affine=nii_img.affine)
     # calculate missing stats for later echoes

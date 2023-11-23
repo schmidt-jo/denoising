@@ -32,6 +32,11 @@ class Config(sp.Serializable):
         default="cp", alias="-m", choices=["cp"],
         help=f"solver for l2 minimization"
     )
+    use_3d: str = sp.field(
+        default=True, alias="-3d", help="use multiple echoes in order to mask all 3 axes,"
+                                        "might not work with slab selective,"
+                                        "need noise voxels in all planes"
+    )
     solver_max_num_iter: int = sp.field(
         alias="-smn", default=50, help="solver algorithm (via method): - maximum number of iterations within"
                                        "(inner loop)"
