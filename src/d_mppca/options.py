@@ -27,14 +27,8 @@ class Config(sp.helpers.Serializable):
         default="d", alias="-fp",
         help=f"Output file prefix appended to name after denoising"
     )
-
-    # mp: bool = sp.field(
-    #     default=True, help="usage of multiprocessing"
-    # )
-    # mp_headroom: int = sp.field(
-    #     default=8, alias="-mph",
-    #     help="minimal unused cores when using multiprocessing"
-    # )
+    use_gpu: bool = sp.field(
+        default=True, alias="-gpu", help="try using gpu processing")
 
     visualize: bool = sp.field(
         default=True, alias="-v", help="toggle show plots"

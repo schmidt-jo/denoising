@@ -14,17 +14,9 @@ import tqdm
 from d_mppca import options
 import torch
 import nibabel as nib
-import multiprocessing as mp
 import itertools
-import torch.nn.functional as nnf
 
 logging.getLogger("simple_parsing").setLevel(logging.WARNING)
-
-
-def batch(iterable, n=1):
-    l = len(iterable)
-    for ndx in range(0, l, n):
-        yield iterable[ndx:min(ndx + n, l)]
 
 
 def den_patch_mp(args):
@@ -64,8 +56,11 @@ def main(config: options.Config):
     logging.info(f"load file: {file_path}")
     affine = torch.load(file_path.as_posix())
 
-    device = torch.device("cuda:0")
-    # we need to batch the data to fit on memory, easiest is to do it slice based
+    if config.use_gpu:
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
+    logging.info("fft to image space")
     img_shape = img_data.shape
     img_data = torch.fft.fftshift(
         torch.fft.fft2(
@@ -77,6 +72,8 @@ def main(config: options.Config):
         ),
         dim=(0, 1)
     )
+
+    # we need to batch the data to fit on memory, easiest is to do it slice based
     # want to batch channel dim and two of the dimensional axis
     # get vars
     m = img_shape[-1]
@@ -84,25 +81,26 @@ def main(config: options.Config):
     n_v = cube_side_len ** 2
     # sliding window, want to move the patch through each dim
     cube_steps_x = torch.arange(0, img_shape[0] - cube_side_len)
+    cube_steps_x = cube_steps_x[:, None] + torch.arange(cube_side_len)[None, :]
     cube_steps_y = torch.arange(0, img_shape[1] - cube_side_len)
+    cube_steps_y = cube_steps_y[:, None] + torch.arange(cube_side_len)[None, :]
+
     # sliding window combinations
     sliding_window = list(itertools.product(cube_steps_x, cube_steps_y))
     # calculate const for mp inequality
     left_b = 4 * torch.sqrt(torch.tensor((m - torch.arange(m - 1)) / n_v)).to(device)
     right_a = (1 / (m - torch.arange(m - 1))).to(device)
-    # batch dim channels * slice
+    # batch dim channels, slice, sliding window combinations
     img_data = torch.movedim(img_data, (3, 2), (0, 1))
     img_data = torch.reshape(img_data, (-1, *img_shape[:2], m))
     data_access = torch.zeros_like(img_data, dtype=torch.float)
     data_denoised = torch.zeros_like(img_data)
-    # treat echoes as batch for unfold
-    un_in = torch.movedim(img_data, -1, 1)
-    batched_data = nnf.unfold(un_in, kernel_size=cube_side_len)
-
+    # batch
+    batch_size = 2000
+    b_sw = torch.tensor_split(torch.tensor(sliding_window), batch_size)
     # dims [b, ch, z, cx, cy, m]
-    for combs in tqdm.tqdm(b_sw, desc='batch processing patches', position=0, leave=False):
+    for combs in tqdm.trange(batch_size, desc='batch processing patches', position=0, leave=False):
         end_xy = combs + cube_side_len
-        # ombs[:, 0]:end_xy[:, 0], combs[:, 1]:end_xy[:, 1]]
 
         # patches = torch.zeros_like(batch_data)
         # for idx_comb in range(combs.shape[0]):
