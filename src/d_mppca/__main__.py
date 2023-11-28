@@ -76,80 +76,83 @@ def main(config: options.Config):
     # we need to batch the data to fit on memory, easiest is to do it slice based
     # want to batch channel dim and two of the dimensional axis
     # get vars
-    m = img_shape[-1]
+    nx, ny, nz, nch, m = img_shape
     cube_side_len = torch.ceil(torch.sqrt(torch.tensor([m]))).to(torch.int).item()
     n_v = cube_side_len ** 2
     # sliding window, want to move the patch through each dim
-    cube_steps_x = torch.arange(0, img_shape[0] - cube_side_len)
-    cube_steps_x = cube_steps_x[:, None] + torch.arange(cube_side_len)[None, :]
-    cube_steps_y = torch.arange(0, img_shape[1] - cube_side_len)
-    cube_steps_y = cube_steps_y[:, None] + torch.arange(cube_side_len)[None, :]
-
-    # sliding window combinations
-    sliding_window = list(itertools.product(cube_steps_x, cube_steps_y))
+    # cube_steps_x = torch.arange(0, img_shape[0] - cube_side_len)[:, None] + torch.arange(cube_side_len)[None, :]
+    # cube_steps_y = torch.arange(0, img_shape[1] - cube_side_len)[:, None] + torch.arange(cube_side_len)[None, :]
+    patch_steps = torch.zeros(
+        (img_shape[0] - cube_side_len, img_shape[1] - cube_side_len, cube_side_len ** 2, 2),
+        dtype=torch.int
+    )
+    for x in torch.arange(0, patch_steps.shape[0]):
+        for y in torch.arange(0, patch_steps.shape[1]):
+            patch_steps[x, y, :, 0] = torch.repeat_interleave(torch.arange(x, x + cube_side_len), cube_side_len)
+            patch_steps[x, y, :, 1] = torch.tile(torch.arange(y, y + cube_side_len), (cube_side_len,))
     # calculate const for mp inequality
     left_b = 4 * torch.sqrt(torch.tensor((m - torch.arange(m - 1)) / n_v)).to(device)
     right_a = (1 / (m - torch.arange(m - 1))).to(device)
-    # batch dim channels, slice, sliding window combinations
-    img_data = torch.movedim(img_data, (3, 2), (0, 1))
-    img_data = torch.reshape(img_data, (-1, *img_shape[:2], m))
-    data_access = torch.zeros_like(img_data, dtype=torch.float)
+    # loop over dim slices, batch dim channels
+    img_data = torch.movedim(img_data, (2, 3), (0, 1))
     data_denoised = torch.zeros_like(img_data)
-    # batch
-    batch_size = 2000
-    b_sw = torch.tensor_split(torch.tensor(sliding_window), batch_size)
-    # dims [b, ch, z, cx, cy, m]
-    for combs in tqdm.trange(batch_size, desc='batch processing patches', position=0, leave=False):
-        end_xy = combs + cube_side_len
+    for idx_slice in tqdm.trange(img_data.shape[0], desc='processing slices', position=0, leave=False):
+        slice_data_access = torch.zeros((nch, nx, ny), dtype=torch.float, device=device)
+        slice_data_denoised = torch.zeros((nch, nx, ny, m), device=device, dtype=img_data.dtype)
+        slice_data = img_data[idx_slice, :, patch_steps[:, :, :, 0], patch_steps[:, :, :, 1]].to(device)
+        for idx_y in tqdm.trange(slice_data.shape[2], desc="loop over dim", position=1, leave=False):
+            patch = slice_data[:, :, idx_y]
+            # try batched svd
+            # patch = img_data[:, :, start_x:end_x, start_y:end_y].to(device)
+            # remove mean across spatial dim of patch
+            patch_mean = torch.mean(patch, dim=-2, keepdim=True)
+            patch -= patch_mean
+            # do svd
+            u, s, v = torch.linalg.svd(patch, full_matrices=False)
+            # eigenvalues -> lambda = s**2 / n_v
+            lam = s ** 2 / n_v
+            # calculate inequality, 3 batch dimensions!
+            left = (lam[:, :, 1:] - lam[:, :, -1, None]) / left_b[None, None]
+            right = right_a[None, None] * torch.cumsum(lam, dim=-1)[:, :, 1:]
+            # minimum p for which left < right
+            # we actually find all p for which left > right and set those 0 in s
+            # p = torch.argmax((left - right < 0).to(torch.int), dim=-1)
+            p = left < right
+            s[:, :, :-1][p] = 0.0
+            s[:, :, -1] = 0.0
+            # calculate denoised data, two batch dims!
+            d = torch.matmul(torch.einsum("iklm, ikm -> iklm", u, s.to(torch.complex128)), v)
+            # add mean
+            d += patch_mean
+            # shape back
+            num_p = torch.argmax(p.to(torch.int), dim=-1)
+            num_p = 1 / (1 + num_p.to(torch.float))
+            # d = torch.movedim(d, 0, -2)
+            # d = torch.reshape(d, patch_shape)
+            # collect
+            # dims [ch, z, c , c, m]
+            # using the multipoint - pointwise approach of overlapping sliding window blocks from manjon et al. 2013
+            # we summarize the contributions of each block at the relevant positions weighted by the
+            # inverse number of nonzero coefficients in the diagonal eigenvalue / singular value matrix. i.e. P
+            slice_data_access[:, patch_steps[:, idx_y, :, 0], patch_steps[:, idx_y, :, 1]] += num_p[:, :, None]
+            slice_data_denoised[:, patch_steps[:, idx_y, :, 0], patch_steps[:, idx_y, :, 1]] += (num_p[:, :, None, None] * d)
 
-        # patches = torch.zeros_like(batch_data)
-        # for idx_comb in range(combs.shape[0]):
-        #     start_x, start_y = combs[idx_comb]
-        #     end_x = start_x + cube_side_len
-        #     end_y = start_y + cube_side_len
-        #     patches[idx_comb] = img_data[:, :, start_x:end_x, start_y:end_y]
-        # try batched svd
-        # patch = img_data[:, :, start_x:end_x, start_y:end_y].to(device)
-        patch_shape = patch.shape
-        # dims [ch, z, patch-size, m]
-        patch = torch.reshape(patch, (*patch_shape[:2], -1, m))
-        # remove mean across spatial dim of patch
-        patch_mean = torch.mean(patch, dim=-2, keepdim=True)
-        patch -= patch_mean
-        # do svd
-        u, s, v = torch.linalg.svd(patch, full_matrices=False)
-        # eigenvalues -> lambda = s**2 / n_v
-        lam = s ** 2 / n_v
-        # calculate inequality, 2 batch dimensions!
-        left = (lam[:, :, 1:] - lam[:, :, -1, None]) / left_b[None, None]
-        right = right_a[None, None] * torch.cumsum(lam, dim=-1)[:, :, 1:]
-        # minimum p for which left < right
-        # we actually find all p for which left > right and set those 0 in s
-        # p = torch.argmax((left - right < 0).to(torch.int), dim=-1)
-        p = left < right
-        s[:, :, :-1][p] = 0.0
-        s[:, :, -1] = 0.0
-        # calculate denoised data, two batch dims!
-        d = torch.matmul(torch.einsum("iklm, ikm -> iklm", u, s.to(torch.complex128)), v)
-        # add mean
-        d += patch_mean
-        # shape back
-        num_p = torch.argmax(p.to(torch.int), dim=-1)
-        num_p = 1 / (1 + num_p.to(torch.float))
-        # d = torch.movedim(d, 0, -2)
-        d = torch.reshape(d, patch_shape)
-        # collect
-        # dims [ch, z, c , c, m]
-        # using the multipoint - pointwise approach of overlapping sliding window blocks from manjon et al. 2013
-        # we summarize the contributions of each block at the relevant positions weighted by the
-        # inverse number of nonzero coefficients in the diagonal eigenvalue / singular value matrix. i.e. P
-        data_access[:, :, start_x:end_x, start_y:end_y] += num_p[:, :, None, None, None]
-        data_denoised[:, :, start_x:end_x, start_y:end_y] += num_p[:, :, None, None, None] * d
+        data_denoised[idx_slice].real = torch.nan_to_num(
+            torch.divide(
+                slice_data_denoised.real,
+                slice_data_access[:, :, :, None]
+            ).cpu(),
+            nan=0.0, posinf=0.0
+        )
+        data_denoised[idx_slice].imag = torch.nan_to_num(
+            torch.divide(
+                slice_data_denoised.imag,
+                slice_data_access[:, :, :, None]
+            ).cpu(),
+            nan=0.0, posinf=0.0
+        )
 
-    data_denoised.real = torch.nan_to_num(data_denoised.real / data_access, nan=0.0, posinf=0.0)
-    data_denoised.imag = torch.nan_to_num(data_denoised.imag / data_access, nan=0.0, posinf=0.0)
-
-    data_denoised = torch.movedim(data_denoised, (0, 1), (3, 2))
+    data_denoised = torch.movedim(data_denoised, (0, 1), (2, 3))
 
     # [x, y, z, ch, t]
     rsos = torch.sqrt(
@@ -173,115 +176,6 @@ def main(config: options.Config):
     logging.info(f"write file: {file_name.as_posix()}")
     torch.save(data_denoised, file_name.as_posix())
 
-
-def main_old():
-    for slice_idx in tqdm.trange(k_shape[2], desc="slice processing", leave=False, position=0):
-        # want channel dim & y as batch dimensions . loop over z and x
-        img_slice = img_data[:, :, slice_idx].to(device)
-
-        data_slice = torch.zeros_like(img_slice, device=device)
-        data_access = torch.zeros_like(img_slice, dtype=torch.float, device=device)
-        # patch based. we extract squares of the next highest squared order compared to the combined echo channel size
-
-        # dims [ch, y batch, patchx, patchy, cube, m]
-        for cube_step_x in tqdm.tqdm(cube_steps_x, desc='batch processing patches', position=1, leave=False):
-            end_x = cube_step_x + cube_side_len
-            # try batched svd
-            patches = torch.zeros((cube_steps_y.shape[0], cube_side_len, cube_side_len, k_shape[-2], m),
-                                  device=device, dtype=img_slice.dtype)
-            for idy in range(cube_steps_y.shape[0]):
-                end_y = cube_steps_y[idy] + cube_side_len
-                patches[idy] = img_slice[cube_step_x:end_x, cube_steps_y[idy]:end_y]
-            patch_shape = patches.shape
-            # move channels to front
-            patches = torch.movedim(patches, -2, 0)
-            # dims [ch, y, patch-size, m]
-            patches = torch.reshape(patches, (patches.shape[0], cube_steps_y.shape[0], -1, m))
-            # remove mean across spatial dim of patch
-            patch_mean = torch.mean(patches, dim=-2, keepdim=True)
-            patches = patches - patch_mean
-            # do svd
-            u, s, v = torch.linalg.svd(patches, full_matrices=False)
-            # eigenvalues -> lambda = s**2 / n_v
-            lam = s**2 / n_v
-            # calculate inequality, 2 batch dimensions!
-            left = (lam[:, :, 1:] - lam[:, :, -1, None]) / left_b[None, None]
-            right = right_a[None, None] * torch.cumsum(lam, dim=-1)[:, :, 1:]
-            # minimum p for which left < right
-            # we actually find all p for which left > right and set those 0 in s
-            # p = torch.argmax((left - right < 0).to(torch.int), dim=-1)
-            p = left < right
-            s[:, :, :-1][p] = 0.0
-            s[:, :, -1] = 0.0
-            # calculate denoised data, two batch dims!
-            d = torch.matmul(torch.einsum("iklm, ikm -> iklm", u, s.to(torch.complex128)), v)
-            # add mean
-            d += patch_mean
-            # shape back
-            num_p = torch.argmax(p.to(torch.int), dim=-1)
-            num_p = 1 / (1 + torch.movedim(num_p, 0, -1).to(torch.float))
-            d = torch.movedim(d, 0, -2)
-            d = torch.reshape(d, patch_shape)
-            # collect
-            # dims [y batch, c, c , m]
-            for idy in range(cube_steps_y.shape[0]):
-                end_y = cube_steps_y[idy] + cube_side_len
-                # using the multipoint - pointwise approach of overlapping sliding window blocks from manjon et al. 2013
-                # we summarize the contributions of each block at the relevant positions weighted by the
-                # inverse number of nonzero coefficients in the diagonal eigenvalue / singular value matrix. i.e. P
-                data_access[cube_step_x:end_x, cube_steps_y[idy]:end_y] += num_p[idy][None, None, :, None]
-                data_slice[cube_step_x:end_x, cube_steps_y[idy]:end_y] += num_p[idy][None, None, :, None] * d[idy]
-        tmp = torch.divide(
-            data_slice,
-            data_access
-        )
-        dd = torch.reshape(tmp.cpu(), (*k_shape[:2], *k_shape[-2:]))
-        denoised_data[:, :, slice_idx].real = torch.nan_to_num(dd.real, nan=0.0, posinf=0.0)
-        denoised_data[:, :, slice_idx].imag = torch.nan_to_num(dd.imag, nan=0.0, posinf=0.0)
-
-        if slice_idx == 0:
-            fig = px.imshow(np.abs(denoised_data[:, :, slice_idx, :8, 0].numpy(force=True)), facet_col=2,
-                            facet_col_wrap=4)
-
-            file_name = path.joinpath("denoised_mppca_slice_0").with_suffix(".html")
-            logging.info(f"write file: {file_name.as_posix()}")
-            fig.write_html(file_name.as_posix())
-            r_slice_fft = torch.fft.fftshift(
-                torch.fft.fft2(
-                    torch.fft.ifftshift(
-                        img_data[:, :, slice_idx, :8, 0]
-                    ),
-                    dim=(0, 1)
-                )
-            )
-            fig = px.imshow(np.abs(r_slice_fft.numpy(force=True)), facet_col=2, facet_col_wrap=4)
-            file_name = path.joinpath("reference_slice_0").with_suffix(".html")
-            logging.info(f"write file: {file_name.as_posix()}")
-            fig.write_html(file_name.as_posix())
-
-    # [x, y, z, ch, t]
-    rsos = torch.sqrt(
-        torch.sum(
-            torch.square(
-                torch.abs(
-                    denoised_data
-                )
-            ),
-            dim=-2
-        )
-    )
-    # save rsos
-    rsos *= 1000.0 / torch.max(rsos)
-    img = nib.Nifti1Image(rsos.numpy(), affine=affine.numpy())
-    file_path = path.joinpath("denoised_mppca_rsos").with_suffix(".nii")
-    logging.info(f"write file: {file_path.as_posix()}")
-    nib.save(img, filename=file_path.as_posix())
-
-    file_name = path.joinpath("denoised_mppca").with_suffix(".pt")
-    logging.info(f"write file: {file_name.as_posix()}")
-    torch.save(denoised_data, file_name.as_posix())
-    # img = nib.Nifti1Image(denoise_data, affine)
-    # nib.save(img, file_name.as_posix())
 
 
 if __name__ == '__main__':
