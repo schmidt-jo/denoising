@@ -8,13 +8,11 @@ _____
 """
 import logging
 import pathlib as plib
-import plotly.express as px
 import numpy as np
 import tqdm
 from d_mppca import options
 import torch
 import nibabel as nib
-import itertools
 
 logging.getLogger("simple_parsing").setLevel(logging.WARNING)
 
