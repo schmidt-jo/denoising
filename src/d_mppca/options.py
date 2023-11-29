@@ -15,9 +15,13 @@ class Config(sp.helpers.Serializable):
         alias="-c", default="",
         help="provide Configuration file (.json)"
     )
-    nii_path: str = sp.field(
+    in_path: str = sp.field(
         alias="-i", default="",
-        help="set filepath to nii file"
+        help="set filepath to .nii or .pt file"
+    )
+    in_affine: str = sp.field(
+        alias="-ia", default="",
+        help="input affine matrix, necessary if input file is .pt, optional if .nii"
     )
     save_path: str = sp.field(
         alias="-s", default="",
@@ -28,13 +32,20 @@ class Config(sp.helpers.Serializable):
         help=f"Output file prefix appended to name after denoising"
     )
     use_gpu: bool = sp.field(
-        default=True, alias="-gpu", help="try using gpu processing")
-
-    visualize: bool = sp.field(
-        default=True, alias="-v", help="toggle show plots"
+        default=True, alias="-gpu", help="try using gpu processing"
+    )
+    gpu_device: int = sp.field(
+        default=0, alias="-gpud", help="specify which gpu to use if applicable, omitted if use_gpu=False"
     )
     debug: bool = sp.field(
         default=False, alias="-d", help="toggle logging debug information"
+    )
+    fixed_p: int = sp.field(
+        default=0, alias="-p", help="(optional) fix the number of singular values to keep in patch."
+                                    "For (default) 0 the number is computed per patch from the MP inequality."
+    )
+    normalize: bool = sp.field(
+        default=False, alias="-n", help="(optional), normalize data (across t dimension) to max 1 before pca"
     )
 
     @classmethod
@@ -48,7 +59,7 @@ class Config(sp.helpers.Serializable):
                 raise FileNotFoundError(err)
             instance = cls.load(c_path.as_posix())
         if not instance.save_path:
-            instance.save_path = plib.Path(instance.nii_path).absolute().parent.as_posix()
+            instance.save_path = plib.Path(instance.in_path).absolute().parent.as_posix()
         instance.display()
         return instance
 
