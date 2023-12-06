@@ -73,14 +73,19 @@ def main(config: options.Config):
         err = "file not .nii or .pt file"
         logging.error(err)
         raise AttributeError(err)
-    name = f"{config.file_prefix}_mppca_rsos_fixed-p-{config.fixed_p}"
+    stem = f"{file_path.stem}"
+    name = f"{config.file_prefix}_mppca"
 
     if config.use_gpu:
         device = torch.device(f"cuda:{config.gpu_device}")
     else:
         device = torch.device("cpu")
-    # logging.info("fft to image space")
+
+    # enable processing of coil combined data. Assume if input is 4D that we have a missing coil dim
     img_shape = img_data.shape
+    while img_shape.__len__() < 5:
+        img_data = torch.unsqueeze(img_data, -2)
+        img_shape = img_data.shape
 
     # we need to batch the data to fit on memory, easiest is to do it dimension based
     # want to batch channel dim and two slice axis (or any dim)
@@ -98,6 +103,7 @@ def main(config: options.Config):
         left_b = None
         right_a = None
         r_cumsum = None
+        name += f"_fixed-p-{config.fixed_p}"
     else:
         p = None
         m_mp_arr = torch.arange(m_mp - 1)
@@ -107,21 +113,28 @@ def main(config: options.Config):
         # dim [mmp, mmp - 1]
         r_cumsum = torch.triu(torch.ones(m_mp - 1, m_mp), diagonal=1).to(device=device, dtype=torch.float64)
 
-    # loop over dim slices, batch dim channels
-    logging.info(f"fft to image space")
-    img_data = torch.fft.fftshift(
-        torch.fft.fft2(
-            torch.fft.ifftshift(
-                img_data,
+    if not config.input_image_data:
+        # if input is k-space data we convert to img space
+        # loop over dim slices, batch dim channels
+        logging.info(f"fft to image space")
+        img_data = torch.fft.fftshift(
+            torch.fft.fft2(
+                torch.fft.ifftshift(
+                    img_data,
+                    dim=(0, 1)
+                ),
                 dim=(0, 1)
             ),
             dim=(0, 1)
-        ),
-        dim=(0, 1)
-    )
+        )
+    # save max value to rescale later
+    # if too high we set it to 1000
+    max_val = torch.max(torch.abs(img_data))
+    if max_val > 1e6:
+        max_val = 1000
     if config.normalize:
         logging.info("normalize data, max 1 magnitude across time dimension")
-        img_data = img_data / torch.max(torch.abs(img_data), dim=-1, keepdim=True)[0]
+        img_data = img_data / max_val
         name = f"{name}_normalized-input"
     img_data = torch.movedim(img_data, (2, 3), (0, 1))
     data_denoised = torch.zeros_like(img_data)
@@ -182,7 +195,7 @@ def main(config: options.Config):
             num_p = torch.argmax(p.to(torch.int), dim=-1).cpu()
             theta_p = 1 / (1 + num_p.to(torch.float))
         # calculate denoised data, two batch dims!
-        d = torch.matmul(torch.einsum("ijklm, ijkm -> ijklm", u, s.to(torch.complex128)), v)
+        d = torch.matmul(torch.einsum("ijklm, ijkm -> ijklm", u, s.to(img_data.dtype)), v)
         # add mean
         d += patch_mean
         # shape back
@@ -202,14 +215,20 @@ def main(config: options.Config):
             data_p[:, :, x_steps[idx_x], idx_y:idx_y+cube_side_len] += num_p[:, :, idx_x, None, None]
             data_p_avg[:, :, x_steps[idx_x], idx_y:idx_y+cube_side_len] += 1
 
-    data_denoised.real = torch.nan_to_num(
-        torch.divide(data_denoised.real, data_access[:, :, :, :, None]),
-        nan=0.0, posinf=0.0
-    )
-    data_denoised.imag = torch.nan_to_num(
-        torch.divide(data_denoised.imag, data_access[:, :, :, :, None]),
-        nan=0.0, posinf=0.0
-    )
+    if torch.is_complex(data_denoised):
+        data_denoised.real = torch.nan_to_num(
+            torch.divide(data_denoised.real, data_access[:, :, :, :, None]),
+            nan=0.0, posinf=0.0
+        )
+        data_denoised.imag = torch.nan_to_num(
+            torch.divide(data_denoised.imag, data_access[:, :, :, :, None]),
+            nan=0.0, posinf=0.0
+        )
+    else:
+        data_denoised = torch.nan_to_num(
+            torch.divide(data_denoised, data_access[:, :, :, :, None]),
+            nan=0.0, posinf=0.0
+        )
 
     data_denoised = torch.movedim(data_denoised, (0, 1), (2, 3))
     data_p_img = torch.nan_to_num(
@@ -218,20 +237,26 @@ def main(config: options.Config):
     )
     data_p_img = torch.movedim(data_p_img, (0, 1), (2, 3))
 
-    # [x, y, z, ch, t]
-    rsos = torch.sqrt(
-        torch.sum(
-            torch.square(
-                torch.abs(
-                    data_denoised
-                )
-            ),
-            dim=-2
+    if data_denoised.shape[-2] > 1:
+        # [x, y, z, ch, t]
+        data_denoised = torch.sqrt(
+            torch.sum(
+                torch.square(
+                    torch.abs(
+                        data_denoised
+                    )
+                ),
+                dim=-2
+            )
         )
-    )
-    # save rsos
-    rsos *= 1000.0 / torch.max(rsos)
-    img = nib.Nifti1Image(rsos.numpy(), affine=affine.numpy())
+        name += "_rsos"
+
+    # save data
+    data_denoised = torch.squeeze(data_denoised)
+    name += f"_{stem}"
+    data_denoised *= max_val / torch.max(data_denoised)
+
+    img = nib.Nifti1Image(data_denoised.numpy(), affine=affine.numpy())
     file_path = save_path.joinpath(name).with_suffix(".nii")
     logging.info(f"write file: {file_path.as_posix()}")
     nib.save(img, filename=file_path.as_posix())

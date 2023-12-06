@@ -29,7 +29,7 @@ class Config(sp.helpers.Serializable):
     )
     file_prefix: str = sp.field(
         default="d", alias="-fp",
-        help=f"Output file prefix appended to name after denoising"
+        help=f"Output file prefix appended to name after denoising / debiasing"
     )
     use_gpu: bool = sp.field(
         default=True, alias="-gpu", help="try using gpu processing"
@@ -46,6 +46,10 @@ class Config(sp.helpers.Serializable):
     )
     normalize: bool = sp.field(
         default=False, alias="-n", help="(optional), normalize data (across t dimension) to max 1 before pca"
+    )
+    input_image_data: bool = sp.field(
+        default=False, alias="-iimg", help="if input is in image space set to true. "
+                                           "Otherwise input is assumed to be k-space data"
     )
 
     @classmethod
@@ -77,7 +81,7 @@ def create_cli() -> (sp.ArgumentParser, sp.ArgumentParser.parse_args):
         Build the parser for arguments
         Parse the input arguments.
         """
-    parser = sp.ArgumentParser(prog='denoising_mm_autodmri')
+    parser = sp.ArgumentParser(prog='denoising_mppca')
     parser.add_arguments(Config, dest="config")
     args = parser.parse_args()
     return parser, args
