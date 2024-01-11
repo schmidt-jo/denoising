@@ -14,6 +14,7 @@ from d_mppca import options
 import torch
 import nibabel as nib
 import plotly.express as px
+import typing
 
 logging.getLogger("simple_parsing").setLevel(logging.WARNING)
 
@@ -73,7 +74,7 @@ def main(config: options.Config):
         err = "file not .nii or .pt file"
         logging.error(err)
         raise AttributeError(err)
-    stem = f"{file_path.stem}"
+    stem = file_path.stem.split(".")[0]
     name = f"{config.file_prefix}_mppca"
 
     if config.use_gpu:
@@ -91,7 +92,6 @@ def main(config: options.Config):
     # want to batch channel dim and two slice axis (or any dim)
     # get vars
     nx, ny, nz, nch, m = img_shape
-    # cube_side_len = 3
     cube_side_len = torch.ceil(torch.sqrt(torch.tensor([m]))).to(torch.int).item()
     n_v = cube_side_len ** 2
     ncx = nx - cube_side_len
@@ -130,7 +130,46 @@ def main(config: options.Config):
     # save max value to rescale later
     # if too high we set it to 1000
     max_val = torch.max(torch.abs(img_data))
-    if max_val > 1e6:
+
+    # we want to implement a first order stationary noise bias removal from Manjon 2015
+    # with noise statistics from mask and St.Jean 2020
+    if config.noise_bias_correction:
+        mask_path = plib.Path(config.noise_bias_mask).absolute()
+        if not mask_path.is_file():
+            err = f"mask input path not pointing to a file ({mask_path.as_posix()})"
+            logging.error(err)
+            raise FileNotFoundError(err)
+        nii_mask = nib.load(mask_path.as_posix())
+        mask = torch.from_numpy(nii_mask.get_fdata())
+        # extend to time dim
+        mask = mask[:, :, :, None, None].expand(-1, -1, -1, *img_data.shape[-2:]).to(torch.bool)
+        # extract noise data
+        noise_voxels = img_data[mask]
+        noise_voxels = noise_voxels[noise_voxels > 0]
+        sigma = get_sigma_from_noise_vox(noise_voxels)
+        num_channels = torch.clamp(torch.round(get_n_from_noise_vox(noise_voxels, sigma)).to(torch.int), 1, 32)
+        # save plot for reference
+        noise_bins = torch.arange(int(max_val / 10)).to(noise_voxels.dtype)
+        noise_hist, _ = torch.histogram(noise_voxels, bins=noise_bins, density=True)
+        noise_hist /= torch.linalg.norm(noise_hist)
+        noise_dist = noise_dist_ncc(noise_bins, sigma=sigma, n=num_channels)
+        noise_dist /= torch.linalg.norm(noise_dist)
+        noise_plot = torch.concatenate((noise_hist[:, None], noise_dist[:-1, None]), dim=1)
+
+        name_list = ["noise voxels", f"noise dist. estimate, sigma: {sigma.item():.2f}, n: {num_channels.item()}"]
+        fig = px.line(noise_plot, labels={'x': 'signal value [a,u,]', 'y': 'normalized count'})
+        for i, trace in enumerate(fig.data):
+            trace.update(name=name_list[i])
+        fig_name = f"{name}_noise_histogramm"
+        fig_file = save_path.joinpath(fig_name).with_suffix(".html")
+        logging.info(f"write file: {fig_file.as_posix()}")
+        fig.write_html(fig_file.as_posix())
+        data_denoised_sq = torch.movedim(torch.zeros_like(img_data), (2, 3), (0, 1))
+    else:
+        sigma = None
+        num_channels = None
+        data_denoised_sq = None
+    if max_val > 1e5:
         max_val = 1000
     if config.normalize:
         logging.info("normalize data, max 1 magnitude across time dimension")
@@ -138,15 +177,17 @@ def main(config: options.Config):
         name = f"{name}_normalized-input"
     img_data = torch.movedim(img_data, (2, 3), (0, 1))
     data_denoised = torch.zeros_like(img_data)
+    data_n_std = torch.zeros_like(img_data)
     data_access = torch.zeros(data_denoised.shape[:-1], dtype=torch.float)
     data_p = torch.zeros(data_access.shape, dtype=torch.int)
     data_p_avg = torch.zeros_like(data_p)
+
     logging.info(f"start processing")
     # x steps batched
     x_steps = torch.arange(ncx)[:, None] + torch.arange(cube_side_len)[None, :]
     for idx_y in tqdm.trange(img_data.shape[3] - cube_side_len, desc="loop over dim 1",
                              position=0, leave=False):
-        patch = img_data[:, :, x_steps, idx_y:idx_y+cube_side_len].to(device)
+        patch = img_data[:, :, x_steps, idx_y:idx_y + cube_side_len].to(device)
         patch_shape = patch.shape
         patch = torch.reshape(patch, (nz, nch, ncx, -1, m))
         patch = torch.movedim(patch, -1, -2)
@@ -175,14 +216,17 @@ def main(config: options.Config):
 
         # do svd
         u, s, v = torch.linalg.svd(patch, full_matrices=False)
-        # eigenvalues -> lambda = s**2 / n_v
-        lam = s ** 2 / n_v
+        svs = s.clone()
         if config.fixed_p > 0:
             # we use the p first singular values
-            s[:, :, :, p:] = 0.0
+            svs[:, :, :, p:] = 0.0
+            # for noise recon
+            s[:, :, :, :p] = 0.0
             num_p = torch.full((nz, nch, ncx), p)
             theta_p = 1 / (1 + num_p)
         else:
+            # eigenvalues -> lambda = s**2 / n_v
+            lam = s ** 2 / n_v
             # calculate inequality, 3 batch dimensions!
             left = (lam[:, :, :, 1:] - lam[:, :, :, -1, None]) / left_b[None, None, None]
             r_lam = torch.einsum('is, czxs -> czxi', r_cumsum, lam)
@@ -190,17 +234,26 @@ def main(config: options.Config):
             # minimum p for which left < right
             # we actually find all p for which left < right and set those 0 in s
             p = left < right
-            s[:, :, :, :-1][p] = 0.0
-            s[:, :, :, -1] = 0.0
+            svs[:, :, :, :-1][p] = 0.0
+            svs[:, :, :, -1] = 0.0
+            # for noise recon
+            s[:, :, :, :p] = 0.0
             num_p = torch.argmax(p.to(torch.int), dim=-1).cpu()
             theta_p = 1 / (1 + num_p.to(torch.float))
         # calculate denoised data, two batch dims!
-        d = torch.matmul(torch.einsum("ijklm, ijkm -> ijklm", u, s.to(img_data.dtype)), v)
+        d = torch.matmul(torch.einsum("ijklm, ijkm -> ijklm", u, svs.to(img_data.dtype)), v)
+        noise = torch.matmul(torch.einsum("ijklm, ijkm -> ijklm", u, s.to(img_data.dtype)), v)
         # add mean
         d += patch_mean
+        # we want to get the noise std across the patch
+        noise = torch.std(noise, dim=-1, keepdim=True)
         # shape back
         d = torch.movedim(d, -2, -1)
         d = torch.reshape(d, patch_shape).cpu()
+        noise = torch.movedim(noise, -2, -1)
+        # need to reverse reduction of spatial dims, dims [nz, nch, ncx, nv, m]
+        noise = noise.expand(-1, -1, -1, n_v, -1)
+        noise = torch.reshape(noise, patch_shape).cpu()
 
         # d = torch.movedim(d, 0, -2)
         # collect
@@ -209,11 +262,16 @@ def main(config: options.Config):
         # we summarize the contributions of each block at the relevant positions weighted by the
         # inverse number of nonzero coefficients in the diagonal eigenvalue / singular value matrix. i.e. P
         for idx_x in range(x_steps.shape[0]):
-            data_denoised[:, :, x_steps[idx_x], idx_y:idx_y+cube_side_len] += (
+            data_denoised[:, :, x_steps[idx_x], idx_y:idx_y + cube_side_len] += (
                     theta_p[:, :, idx_x, None, None, None] * d[:, :, idx_x])
-            data_access[:, :, x_steps[idx_x], idx_y:idx_y+cube_side_len] += theta_p[:, :, idx_x, None, None]
-            data_p[:, :, x_steps[idx_x], idx_y:idx_y+cube_side_len] += num_p[:, :, idx_x, None, None]
-            data_p_avg[:, :, x_steps[idx_x], idx_y:idx_y+cube_side_len] += 1
+            data_n_std[:, :, x_steps[idx_x], idx_y:idx_y + cube_side_len] += (
+                    theta_p[:, :, idx_x, None, None, None] * noise[:, :, idx_x])
+            data_access[:, :, x_steps[idx_x], idx_y:idx_y + cube_side_len] += theta_p[:, :, idx_x, None, None]
+            data_p[:, :, x_steps[idx_x], idx_y:idx_y + cube_side_len] += num_p[:, :, idx_x, None, None]
+            data_p_avg[:, :, x_steps[idx_x], idx_y:idx_y + cube_side_len] += 1
+            if config.noise_bias_correction:
+                data_denoised_sq[:, :, x_steps[idx_x], idx_y:idx_y + cube_side_len] += (
+                    theta_p[:, :, idx_x, None, None, None] * torch.abs(d[:, :, idx_x]) ** 2)
 
     if torch.is_complex(data_denoised):
         data_denoised.real = torch.nan_to_num(
@@ -224,13 +282,53 @@ def main(config: options.Config):
             torch.divide(data_denoised.imag, data_access[:, :, :, :, None]),
             nan=0.0, posinf=0.0
         )
+        data_n_std.real = torch.nan_to_num(
+            torch.divide(data_n_std.real, data_access[:, :, :, :, None]),
+            nan=0.0, posinf=0.0
+        )
+        data_n_std.imag = torch.nan_to_num(
+            torch.divide(data_n_std.imag, data_access[:, :, :, :, None]),
+            nan=0.0, posinf=0.0
+        )
     else:
         data_denoised = torch.nan_to_num(
             torch.divide(data_denoised, data_access[:, :, :, :, None]),
             nan=0.0, posinf=0.0
         )
+        data_n_std = torch.nan_to_num(
+            torch.divide(data_n_std, data_access[:, :, :, :, None]),
+            nan=0.0, posinf=0.0
+        )
+
+    if config.noise_bias_correction:
+        data_denoised_sq = torch.nan_to_num(
+            torch.divide(data_denoised_sq, data_access[:, :, :, :, None])
+        )
+        # ns unlm, pieciak et al 2018
+        data_denoised_pieciak = 0.5 * (data_denoised + torch.sqrt(
+            torch.clip(
+                data_denoised**2 - 2 * (2 * num_channels - 1) * sigma ** 2,
+                min=0
+            )
+        ))
+
+        # # original
+        data_denoised_manjon = torch.sqrt(
+            torch.clip(
+                data_denoised**2 - 2 * num_channels * sigma ** 2,
+                min=0.0
+            )
+        )
+        # js
+        data_denoised_js = torch.sqrt(
+            torch.clip(
+                data_denoised**2 - 2 * num_channels * data_n_std ** 2,
+                min=0.0
+            )
+        )
 
     data_denoised = torch.movedim(data_denoised, (0, 1), (2, 3))
+    data_n_std = torch.movedim(data_n_std, (0, 1), (2, 3))
     data_p_img = torch.nan_to_num(
         torch.divide(data_p, data_p_avg),
         nan=0.0, posinf=0.0
@@ -249,10 +347,22 @@ def main(config: options.Config):
                 dim=-2
             )
         )
+        # [x, y, z, ch, t]
+        data_n_std = torch.sqrt(
+            torch.sum(
+                torch.square(
+                    torch.abs(
+                        data_n_std
+                    )
+                ),
+                dim=-2
+            )
+        )
         name += "_rsos"
 
     # save data
     data_denoised = torch.squeeze(data_denoised)
+    data_n_std = torch.squeeze(data_n_std)
     name += f"_{stem}"
     data_denoised *= max_val / torch.max(data_denoised)
 
@@ -265,10 +375,59 @@ def main(config: options.Config):
     file_path = save_path.joinpath(f"{name}_avg_p").with_suffix(".nii")
     logging.info(f"write file: {file_path.as_posix()}")
     nib.save(img, filename=file_path.as_posix())
+    # save noise data
+    img = nib.Nifti1Image(data_n_std.numpy(), affine=affine.numpy())
+    file_path = save_path.joinpath(f"{name}_noise_std").with_suffix(".nii")
+    logging.info(f"write file: {file_path.as_posix()}")
+    nib.save(img, filename=file_path.as_posix())
 
     file_name = save_path.joinpath(name).with_suffix(".pt")
     logging.info(f"write file: {file_name.as_posix()}")
     torch.save(data_denoised, file_name.as_posix())
+
+    if config.noise_bias_correction:
+        names = ["manjon", "pieciak", "js"]
+        ddata = [data_denoised_manjon, data_denoised_pieciak, data_denoised_js]
+        for d_idx in range(len(names)):
+            # save data
+            dd = torch.movedim(ddata[d_idx], (0, 1), (2, 3))
+            dd = torch.squeeze(dd)
+            name_ = f"{name}_nbc-{names[d_idx]}"
+            dd *= max_val / torch.max(dd)
+
+            img = nib.Nifti1Image(dd.numpy(), affine=affine.numpy())
+            file_path = save_path.joinpath(name_).with_suffix(".nii")
+            logging.info(f"write file: {file_path.as_posix()}")
+            nib.save(img, filename=file_path.as_posix())
+
+
+def get_n_from_noise_vox(noise_voxel_data: torch.tensor, sigma: float):
+    return 1 / (2 * noise_voxel_data.shape[0] * sigma ** 2) * torch.sum(noise_voxel_data ** 2, dim=0)
+
+
+def get_sigma_from_noise_vox(noise_voxel_data: torch.tensor):
+    num_pts = noise_voxel_data.shape[0]
+    a = torch.sqrt(torch.tensor([1 / 2]))
+    b = torch.sum(noise_voxel_data ** 4, dim=0) / torch.sum(noise_voxel_data ** 2, dim=0)
+    c = 1 / num_pts * torch.sum(noise_voxel_data ** 2, dim=0)
+    d = torch.sqrt(b - c)
+    return a * d
+
+
+def noise_dist_jean(x: torch.tensor, sigma: typing.Union[torch.tensor, float], n: typing.Union[torch.tensor, int]):
+    sigma = torch.as_tensor(sigma).to(torch.float64)
+    t = x ** 2 / (2 * sigma ** 2)
+    n = torch.round(torch.as_tensor(n)).to(torch.int)
+    return 1 / torch.exp(torch.lgamma(n)) * torch.pow(t, n - 1) * torch.exp(-t)
+
+
+def noise_dist_ncc(x: torch.tensor, sigma: typing.Union[torch.tensor, float], n: typing.Union[torch.tensor, int]):
+    sigma = torch.as_tensor(sigma).to(torch.float64)
+    n = torch.round(torch.as_tensor(n)).to(torch.int)
+    a = torch.pow(x, 2 * n - 1)
+    b = torch.pow(2, n - 1) * torch.pow(sigma, 2 * n) * torch.exp(torch.lgamma(n))
+    c = torch.exp((-x ** 2) / (2 * sigma ** 2))
+    return a / b * c
 
 
 def batch_cov_removed_mean(points):

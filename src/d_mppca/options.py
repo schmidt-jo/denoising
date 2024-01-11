@@ -3,6 +3,7 @@ import simple_parsing as sp
 import pathlib as plib
 import logging
 import pandas as pd
+
 log_module = logging.getLogger(__name__)
 
 
@@ -50,6 +51,15 @@ class Config(sp.helpers.Serializable):
     input_image_data: bool = sp.field(
         default=False, alias="-iimg", help="if input is in image space set to true. "
                                            "Otherwise input is assumed to be k-space data"
+    )
+    noise_bias_correction: bool = sp.field(
+        default=False, alias="-nbc",
+        help="(optional) noise bias correction "
+             "using stationary or non stationary noise estimates and "
+             "assuming non-central chi noise distribution."
+    )
+    noise_bias_mask: str = sp.field(
+        default="", alias="-nbm", help="input noise mask for noise statistics estimation if bias correction is set."
     )
 
     @classmethod
