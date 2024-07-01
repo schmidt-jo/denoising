@@ -3,6 +3,7 @@ import pandas as pd
 import logging
 import pathlib as plib
 import dataclasses as dc
+
 log_module = logging.getLogger(__name__)
 
 
@@ -24,18 +25,21 @@ class Config(sp.Serializable):
         help="set path to save files (optional, if blank use input path)"
     )
     file_prefix: str = sp.field(
-        default="d", alias="-fp",
+        default="deb", alias="-fp",
         help=f"Output file prefix appended to name after denoising"
     )
-
+    input_mask: str = sp.field(
+        default="", alias="-im",
+        help="Input Mask of noise voxels to extract characteristics (optional), if left blank: using autodmri."
+    )
     method: int = sp.field(
         default="cp", alias="-m", choices=["cp"],
         help=f"solver for l2 minimization"
     )
     use_3d: str = sp.field(
-        default=True, alias="-3d", help="use multiple echoes in order to mask all 3 axes,"
-                                        "might not work with slab selective,"
-                                        "need noise voxels in all planes"
+        default=False, alias="-3d", help="Only for autodmri: use multiple echoes in order to mask all 3 axes,"
+                                         "might not work with slab selective,"
+                                         "need noise voxels in all planes"
     )
     solver_max_num_iter: int = sp.field(
         alias="-smn", default=50, help="solver algorithm (via method): - maximum number of iterations within"
@@ -97,4 +101,3 @@ def create_cli() -> (sp.ArgumentParser, sp.ArgumentParser.parse_args):
     parser.add_arguments(Config, dest="config")
     args = parser.parse_args()
     return parser, args
-

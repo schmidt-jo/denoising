@@ -21,6 +21,7 @@ def main(config: options.Config):
 
     logging.info(f"__ Loading input")
     nii_data, nii_img = d_io.load_nii_data(config.nii_path)
+    nii_max_val = np.max(nii_data)
     # input assumed to be 4d
     while len(nii_data.shape) < 4:
         nii_data = np.expand_dims(nii_data, -1)
@@ -31,28 +32,39 @@ def main(config: options.Config):
         nii_data /= rescale_factor
     else:
         rescale_factor = 1.0
-    # run denoizing
+    # run de-biasing
     logging.info(f"__ Run")
     # for now take first echo to extract mask
     d_nii_data = nii_data[:, :, :, 0].copy()
     # extract noise
     logging.info("__ Extract noise stats")
-    if config.use_3d:
-        # want to use 3 consecutive echoes to extract per axis
-        mask = np.zeros_like(nii_data, dtype=bool)
-        sigma = num_channels = np.zeros_like(nii_data[:, :, :, 0])
-        for k in range(3):
-            logging.info(f"\t dim {k + 1}")
-
-            s_, n_, mask_1d = ade.estimate_from_dwis(
-                data=d_nii_data[:, :, :], axis=k, return_mask=True,
-                exclude_mask=None, ncores=num_cpus, method="moments", verbose=2, fast_median=False
-            )
-            sigma = np.moveaxis(sigma, k, 0)
-            sigma += s_[:, None, None]
-            sigma = np.moveaxis(sigma, k, 0)
-            mask = mask | mask_1d[:, :, :, None]
+    if config.input_mask:
+        mask_path = plib.Path(config.input_mask).absolute()
+        if not mask_path.is_file():
+            err = f"mask input path not pointing to a file ({mask_path.as_posix()})"
+            logging.error(err)
+            raise FileNotFoundError(err)
+        mask, nii_mask_affine = d_io.load_nii_data(mask_path.as_posix())
+        # extend to time dim
+        mask = np.repeat(mask[:, :, :, None], axis=-1, repeats=nii_data.shape[-1])
+        # repeat extraction of noise
+        noise_voxels = nii_data[mask.astype(bool)]
+        noise_voxels = noise_voxels[noise_voxels > 0]
+        sigma = get_sigma_from_noise_vox(noise_voxels)
+        num_channels = get_n_from_noise_vox(noise_voxels, sigma)
+        # take whole volume for denoising
+        d_nii_data = nii_data.copy()
+        mp_list = [(
+            d_nii_data[:, :, k],
+            sigma,
+            num_channels,
+            config.max_num_iter,
+            config.solver_max_num_iter,
+            config.solver_tv_lambda,
+            k) for k in range(d_nii_data.shape[2])
+        ]
     else:
+        # using auto dmri
         # using only slice dimension, assumed to be last dim
         sigma, num_channels, mask = ade.estimate_from_dwis(
             data=d_nii_data, axis=-1, return_mask=True,
@@ -60,27 +72,30 @@ def main(config: options.Config):
         )
         # reshape
         mask = np.repeat(mask[:, :, :, None], axis=-1, repeats=nii_data.shape[-1])
-    # save mask
-    d_io.save_nii(mask, file_path=path, name=f"autodmri_mask", affine=nii_img.affine)
-    # calculate missing stats for later echoes
-    for k in tqdm.trange(nii_data.shape[2], desc="get noise dist per slice"):
-        # repeat extraction of noise
-        noise_voxels = nii_data[:, :, k][mask[:, :, k].astype(bool)]
-        noise_voxels = noise_voxels[noise_voxels > 0]
-        sigma[k] = get_sigma_from_noise_vox(noise_voxel_data=noise_voxels)
-        num_channels[k] = get_n_from_noise_vox(noise_voxel_data=noise_voxels, sigma=sigma[k])
-
-    # take whole volume for denoising
-    d_nii_data = nii_data.copy()
-    mp_list = [(
-        d_nii_data[:, :, k],
-        sigma[k],
-        num_channels[k],
-        config.max_num_iter,
-        config.solver_max_num_iter,
-        config.solver_tv_lambda,
-        k) for k in range(d_nii_data.shape[2])
-    ]
+        # save mask
+        d_io.save_nii(mask, file_path=path, name=f"autodmri_mask", affine=nii_img.affine)
+        # calculate missing stats for later echoes
+        for k in tqdm.trange(nii_data.shape[2], desc="get noise dist per slice"):
+            # repeat extraction of noise
+            noise_voxels = nii_data[:, :, k][mask[:, :, k].astype(bool)]
+            noise_voxels = noise_voxels[noise_voxels > 0]
+            sigma[k] = get_sigma_from_noise_vox(noise_voxel_data=noise_voxels)
+            num_channels[k] = get_n_from_noise_vox(noise_voxel_data=noise_voxels, sigma=sigma[k])
+        if config.visualize:
+            plotting.plot_noise_sigma_n(sigma=sigma, n=num_channels, config=config,
+                                        name=f"autodmri_sigma_n_mn-{config.max_num_iter}_"
+                                             f"stvlam-{config.solver_tv_lambda:.2f}".replace(".", "p"))
+        # take whole volume for denoising
+        d_nii_data = nii_data.copy()
+        mp_list = [(
+            d_nii_data[:, :, k],
+            sigma[k],
+            num_channels[k],
+            config.max_num_iter,
+            config.solver_max_num_iter,
+            config.solver_tv_lambda,
+            k) for k in range(d_nii_data.shape[2])
+        ]
     num_cpus = np.max([4, mp.cpu_count() - config.mp_headroom])  # take at least 4, leave mp Headroom
     logging.info(f"multiprocessing using {num_cpus} cpus")
     with mp.Pool(num_cpus) as p:
@@ -98,14 +113,11 @@ def main(config: options.Config):
     #     d_nii_data[:, :, slice_idx] = chambolle_pock.chambolle_pock_tv(
     #         y, chambolle_pock_lambda, n_it=config.num_max_runs
     #     )
-    if config.visualize:
-        plotting.plot_noise_sigma_n(sigma=sigma, n=num_channels, config=config,
-                                    name=f"autodmri_sigma_n_mn-{config.max_num_iter}_"
-                                         f"stvlam-{config.solver_tv_lambda:.2f}".replace(".", "p"))
 
-    name = (f"{config.file_prefix}_{file_name}_mn-{config.max_num_iter}_"
+    name = (f"{config.file_prefix}_mmncc_{file_name}_mn-{config.max_num_iter}_"
             f"stvlam-{config.solver_tv_lambda:.2f}").replace(".", "p")
-    d_io.save_nii(d_nii_data * rescale_factor, file_path=config.save_path, name=name, affine=nii_img.affine)
+    output_nii = np.clip(d_nii_data * rescale_factor, 0, nii_max_val)
+    d_io.save_nii(output_nii, file_path=config.save_path, name=name, affine=nii_img.affine)
 
 
 def wrap_for_mp(args):
