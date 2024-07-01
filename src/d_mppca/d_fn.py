@@ -87,7 +87,12 @@ def main(config: d_mppca.Config):
 
     # enable processing of coil combined data. Assume if input is 4D that we have a missing coil dim
     img_shape = img_data.shape
-    while img_shape.__len__() < 5:
+    if img_shape.__len__() < 4:
+        msg = "assume no time dimension"
+        log_module.info(msg)
+        img_data = torch.unsqueeze(img_data, -1)
+    if img_shape.__len__() < 5:
+        msg = "assume no channel dimension"
         img_data = torch.unsqueeze(img_data, -2)
         img_shape = img_data.shape
 
@@ -328,9 +333,9 @@ def main(config: d_mppca.Config):
             nan=0.0, posinf=0.0
         )
     # simple corrections scheme glenn - across time points versus diffusion gradients
-    sigma_glenn = (m / m-1) * (
-            torch.mean(img_data**2, dim=-1, keepdim=True) - torch.mean(img_data, dim=-1, keepdim=True)**2
-    )
+    # sigma_glenn = (m / m-1) * (
+    #         torch.mean(img_data**2, dim=-1, keepdim=True) - torch.mean(img_data, dim=-1, keepdim=True)**2
+    # )
     if config.noise_bias_correction:
         # # original
         data_denoised_manjon = torch.sqrt(
@@ -340,25 +345,25 @@ def main(config: d_mppca.Config):
             )
         )
         # js
-        data_denoised_js_std = torch.sqrt(
-            torch.clip(
-                data_denoised ** 2 - 2 * num_channels * data_n[2]**2,
-                min=0.0
-            )
-        )
-        # glenn
-        data_denoised_glenn = torch.sqrt(
-            torch.clip(
-                data_denoised ** 2 - 2 * num_channels * sigma_glenn,
-                min=0.0
-            )
-        )
-        data_denoised_js_n = torch.sqrt(
-            torch.clip(
-                data_denoised ** 2 - 2 * num_channels * data_n[0],
-                min=0.0
-            )
-        )
+        # data_denoised_js_std = torch.sqrt(
+        #     torch.clip(
+        #         data_denoised ** 2 - 2 * num_channels * data_n[2]**2,
+        #         min=0.0
+        #     )
+        # )
+        # # glenn
+        # data_denoised_glenn = torch.sqrt(
+        #     torch.clip(
+        #         data_denoised ** 2 - 2 * num_channels * sigma_glenn,
+        #         min=0.0
+        #     )
+        # )
+        # data_denoised_js_n = torch.sqrt(
+        #     torch.clip(
+        #         data_denoised ** 2 - 2 * num_channels * data_n[0],
+        #         min=0.0
+        #     )
+        # )
 
     data_denoised = torch.movedim(data_denoised, (0, 1), (2, 3))
     data_n = torch.movedim(data_n, (1, 2), (3, 4))
@@ -421,8 +426,10 @@ def main(config: d_mppca.Config):
     torch.save(data_denoised, file_name.as_posix())
 
     if config.noise_bias_correction:
-        names = ["manjon", "js_n", "js_std", "glenn"]
-        ddata = [data_denoised_manjon, data_denoised_js_n, data_denoised_js_std, data_denoised_glenn]
+        # names = ["manjon", "js_n", "js_std", "glenn"]
+        names = ["manjon"]
+        # ddata = [data_denoised_manjon, data_denoised_js_n, data_denoised_js_std, data_denoised_glenn]
+        ddata = [data_denoised_manjon]
         for d_idx in range(len(names)):
             # save data
             dd = torch.movedim(ddata[d_idx], (0, 1), (2, 3))

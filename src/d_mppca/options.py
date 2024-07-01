@@ -13,7 +13,7 @@ class Config(sp.helpers.Serializable):
     Configuration for denoising
     """
     config_file: str = sp.field(
-        alias="-c", default="",
+        alias="-c", default="../examples/config.json",
         help="provide Configuration file (.json)"
     )
     in_path: str = sp.field(
