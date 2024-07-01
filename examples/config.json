@@ -1,0 +1,15 @@
+{
+  "config_file": "../examples/config.json",
+  "in_path": "../examples/phant_acq-fa135_echo-01_MESE.nii",
+  "in_affine": "",
+  "save_path": "../examples/",
+  "file_prefix": "d",
+  "use_gpu": true,
+  "gpu_device": 0,
+  "debug": false,
+  "fixed_p": 1,
+  "normalize": false,
+  "input_image_data": true,
+  "noise_bias_correction": true,
+  "noise_bias_mask": ""
+}
